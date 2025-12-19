@@ -30,7 +30,16 @@ type StoredItem struct {
 	Distance   float64
 }
 
+// IndexEntry holds pre-calculated data ready to be written to disk
+type IndexEntry struct {
+	ID    string
+	Blob  []byte   // The binary encoding (Geo + Props)
+	Terms []string // The S2 index terms
+}
+
 func NewGeoStore(dbPath string) (*GeoStore, error) {
+	// Open with options to allow better fill percentage on bulk imports
+	// strict mode off can be faster, but default is safer.
 	db, err := bolt.Open(dbPath, 0600, nil)
 	if err != nil {
 		return nil, err
@@ -60,58 +69,82 @@ func (gs *GeoStore) Close() error {
 	return gs.db.Close()
 }
 
-// Put accepts GeoJSON, converts to S2 Binary, and stores it.
-func (gs *GeoStore) Put(id string, geoJSON []byte) error {
+// PrepareIndexEntry performs all CPU heavy work (Parsing, Math, Encoding).
+// This is safe to run in parallel workers.
+func (gs *GeoStore) PrepareIndexEntry(id string, geoJSON []byte) (IndexEntry, error) {
 	var feature geom.GeoJSONFeature
 	if err := json.Unmarshal(geoJSON, &feature); err != nil {
-		return fmt.Errorf("invalid geojson: %w", err)
+		return IndexEntry{}, fmt.Errorf("invalid geojson: %w", err)
 	}
 	if feature.Geometry.IsEmpty() {
-		return errors.New("geometry is empty")
+		return IndexEntry{}, errors.New("geometry is empty")
 	}
 
-	// 1. Convert
+	// 1. Convert to S2
 	region, err := geomToS2(feature.Geometry)
 	if err != nil {
-		return err
+		return IndexEntry{}, err
 	}
 
 	// 2. Props
 	propsJSON, err := json.Marshal(feature.Properties)
 	if err != nil {
-		return err
+		return IndexEntry{}, err
 	}
 
 	// 3. Encode S2 Binary
 	storageBytes, err := encodeEntry(region, propsJSON)
 	if err != nil {
-		return err
+		return IndexEntry{}, err
 	}
 
-	// 4. Index
+	// 4. Calculate Index Terms (Math heavy)
 	terms := gs.indexer.GetIndexTerms(region, "")
 
+	return IndexEntry{
+		ID:    id,
+		Blob:  storageBytes,
+		Terms: terms,
+	}, nil
+}
+
+// WriteBatch writes a slice of pre-calculated entries in a single transaction.
+func (gs *GeoStore) WriteBatch(entries []IndexEntry) error {
 	return gs.db.Update(func(tx *bolt.Tx) error {
 		bObj := tx.Bucket([]byte(bucketObjects))
 		bIdx := tx.Bucket([]byte(bucketIndex))
+		// Optional: bIdx.FillPercent = 0.9 for bulk loading
 
-		// Save S2 Binary blob
-		if err := bObj.Put([]byte(id), storageBytes); err != nil {
-			return err
-		}
-
-		// Save Index Terms
-		for _, term := range terms {
-			key := make([]byte, 0, len(term)+1+len(id))
-			key = append(key, term...)
-			key = append(key, 0) // Null byte separator
-			key = append(key, id...)
-			if err := bIdx.Put(key, []byte("1")); err != nil {
+		for _, entry := range entries {
+			// Save S2 Binary blob
+			if err := bObj.Put([]byte(entry.ID), entry.Blob); err != nil {
 				return err
+			}
+
+			// Save Index Terms
+			for _, term := range entry.Terms {
+				// Allocation optimization: pre-calculate size
+				key := make([]byte, len(term)+1+len(entry.ID))
+				copy(key, term)
+				key[len(term)] = 0
+				copy(key[len(term)+1:], entry.ID)
+
+				if err := bIdx.Put(key, []byte("1")); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	})
+}
+
+// Put Legacy helper wrapper
+func (gs *GeoStore) Put(id string, geoJSON []byte) error {
+	entry, err := gs.PrepareIndexEntry(id, geoJSON)
+	if err != nil {
+		return err
+	}
+	return gs.WriteBatch([]IndexEntry{entry})
 }
 
 func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64) ([]StoredItem, error) {
@@ -208,4 +241,30 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64) ([]Store
 	})
 
 	return results, nil
+}
+
+func CompactDB(srcPath, dstPath string) error {
+	// Open Source DB
+	src, err := bolt.Open(srcPath, 0600, nil)
+	if err != nil {
+		return fmt.Errorf("failed to open src db: %w", err)
+	}
+	defer src.Close()
+
+	// Open Destination DB
+	dst, err := bolt.Open(dstPath, 0600, nil)
+	if err != nil {
+		return fmt.Errorf("failed to open dst db: %w", err)
+	}
+	defer dst.Close()
+
+	// Compact
+	// txMaxSize is the transaction size limit (0 = default 64k).
+	// It creates a transaction, copies data until size limit, then commits and starts new tx.
+	err = bolt.Compact(dst, src, 0)
+	if err != nil {
+		return fmt.Errorf("compaction failed: %w", err)
+	}
+
+	return nil
 }
