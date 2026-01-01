@@ -150,7 +150,7 @@ func (f *LazyShapeFactory) Len() int {
 }
 
 // decodeFullEntry parses headers and returns properties, the lazy index, and the factory.
-func decodeFullEntry(data []byte) ([]byte, *s2.EncodedS2ShapeIndex, *LazyShapeFactory, error) {
+func decodeFullEntry(data []byte) ([]byte, *s2.EncodedShapeIndex, *LazyShapeFactory, error) {
 	r := bytes.NewReader(data)
 
 	// 1. Properties
@@ -198,11 +198,11 @@ func decodeFullEntry(data []byte) ([]byte, *s2.EncodedS2ShapeIndex, *LazyShapeFa
 	factory := &LazyShapeFactory{r: bytes.NewReader(data), shapes: infos}
 
 	// Create a new reader from current position for the index init
-	// (EncodedS2ShapeIndex.Init wraps in bufio if not ByteReader, bytes.Reader is fine)
+	// (EncodedShapeIndex.Init wraps in bufio if not ByteReader, bytes.Reader is fine)
 	// We need to pass the *remaining* part of stream or just the reader current pos?
 	// bytes.Reader tracks position.
 
-	index := s2.NewEncodedS2ShapeIndex()
+	index := s2.NewEncodedShapeIndex()
 	if err := index.Init(r, factory); err != nil {
 		return nil, nil, nil, fmt.Errorf("index init failed: %w", err)
 	}
