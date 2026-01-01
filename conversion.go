@@ -7,7 +7,7 @@ import (
 	geom "github.com/peterstace/simplefeatures/geom"
 )
 
-// PointRegion wraps s2.Point to satisfy the s2.Region interface for Indexing.
+// PointRegion wraps s2.Point to satisfy the s2.Region interface for Indexing (Term generation).
 type PointRegion struct {
 	s2.Point
 }
@@ -19,83 +19,104 @@ func (p PointRegion) IntersectsCell(c s2.Cell) bool     { return c.ContainsPoint
 func (p PointRegion) ContainsPoint(other s2.Point) bool { return p.Point == other }
 func (p PointRegion) CellUnionBound() []s2.CellID       { return p.CapBound().CellUnionBound() }
 
-// MultiPointData holds data for storage only. It does NOT implement s2.Region.
-type MultiPointData struct {
-	Points []s2.Point
-}
-
-// MultiPolylineData holds data for storage only. It does NOT implement s2.Region.
-type MultiPolylineData struct {
-	Polylines []*s2.Polyline
-}
-
-// geomToS2 returns:
-// The data object to store (Point, *Polyline, *Polygon, *MultiPointData, etc.)
-// A slice of atomic s2.Regions to generate index terms from.
-func geomToS2(g geom.Geometry) (interface{}, []s2.Region, error) {
+// geomToS2 converts geometry to:
+// 1. A slice of s2.Shape (for the ShapeIndex)
+// 2. A slice of s2.Region (for TermIndexing)
+func geomToS2(g geom.Geometry) ([]s2.Shape, []s2.Region, error) {
 	switch g.Type() {
 	case geom.TypePoint:
 		pt := pointToS2(g.MustAsPoint())
-		// Store as Point, Index as PointRegion
-		return pt, []s2.Region{PointRegion{pt}}, nil
+		// PointVector implements Shape
+		pv := s2.PointVector{pt}
+		return []s2.Shape{&pv}, []s2.Region{PointRegion{pt}}, nil
 
 	case geom.TypeLineString:
 		ls := lineStringToS2(g.MustAsLineString())
-		return ls, []s2.Region{ls}, nil
+		return []s2.Shape{ls}, []s2.Region{ls}, nil
 
 	case geom.TypePolygon:
 		poly := polygonToS2(g.MustAsPolygon())
-		return poly, []s2.Region{poly}, nil
+		return []s2.Shape{poly}, []s2.Region{poly}, nil
 
 	case geom.TypeMultiPoint:
 		mp := g.MustAsMultiPoint()
 		n := mp.NumPoints()
-		data := &MultiPointData{Points: make([]s2.Point, n)}
+		pts := make(s2.PointVector, n)
 		regions := make([]s2.Region, n)
 		for i := 0; i < n; i++ {
 			pt := pointToS2(mp.PointN(i))
-			data.Points[i] = pt
+			pts[i] = pt
 			regions[i] = PointRegion{pt}
 		}
-		return data, regions, nil
+		// Single shape for all points
+		return []s2.Shape{&pts}, regions, nil
 
 	case geom.TypeMultiLineString:
 		ml := g.MustAsMultiLineString()
 		n := ml.NumLineStrings()
-		data := &MultiPolylineData{Polylines: make([]*s2.Polyline, n)}
+		shapes := make([]s2.Shape, n)
 		regions := make([]s2.Region, n)
 		for i := 0; i < n; i++ {
 			pl := lineStringToS2(ml.LineStringN(i))
-			data.Polylines[i] = pl
+			shapes[i] = pl
 			regions[i] = pl
 		}
-		return data, regions, nil
+		return shapes, regions, nil
 
 	case geom.TypeMultiPolygon:
-		// S2 Polygon handles MultiPolygon topology (multiple loops).
-		// We store and index it as a single S2 Polygon.
 		poly := multiPolygonToS2(g.MustAsMultiPolygon())
-		return poly, []s2.Region{poly}, nil
+		return []s2.Shape{poly}, []s2.Region{poly}, nil
 
 	default:
 		return nil, nil, fmt.Errorf("unsupported geometry type: %s", g.Type())
 	}
 }
 
-func s2ToGeom(data interface{}) (geom.Geometry, error) {
-	switch v := data.(type) {
-	case s2.Point:
-		return s2PointToGeom(v), nil
+// shapesToGeom reconstructs geometry from a slice of shapes.
+// This is approximate as we lose the distinction between MultiPolygon and Polygon in S2,
+// but sufficient for returning results.
+func shapesToGeom(shapes []s2.Shape) geom.Geometry {
+	if len(shapes) == 0 {
+		return geom.Geometry{}
+	}
+
+	// Handle single shape cases common in simple features
+	if len(shapes) == 1 {
+		return shapeToGeom(shapes[0])
+	}
+
+	// Multiple shapes imply MultiLineString (from our conversion logic above).
+	// Points are combined into one PointVector, Polygons into one S2Polygon.
+	// So multiple shapes here usually means multiple Polylines.
+	var lines []geom.LineString
+	for _, s := range shapes {
+		g := shapeToGeom(s)
+		if g.IsLineString() {
+			lines = append(lines, g.MustAsLineString())
+		}
+	}
+	if len(lines) > 0 {
+		return geom.NewMultiLineString(lines).AsGeometry()
+	}
+
+	// Fallback return first
+	return shapeToGeom(shapes[0])
+}
+
+func shapeToGeom(s s2.Shape) geom.Geometry {
+	switch v := s.(type) {
+	case *s2.PointVector:
+		if len(*v) == 1 {
+			return s2PointToGeom((*v)[0])
+		}
+		return s2MultiPointToGeom(v)
 	case *s2.Polyline:
-		return s2PolylineToGeom(v), nil
+		return s2PolylineToGeom(v)
 	case *s2.Polygon:
-		return s2PolygonToGeom(v), nil
-	case *MultiPointData:
-		return s2MultiPointToGeom(v), nil
-	case *MultiPolylineData:
-		return s2MultiPolylineToGeom(v), nil
+		return s2PolygonToGeom(v)
 	default:
-		return geom.Geometry{}, fmt.Errorf("unsupported storage type: %T", data)
+		// Attempt fallback by dimension?
+		return geom.Geometry{}
 	}
 }
 
@@ -165,6 +186,15 @@ func s2PointToGeom(pt s2.Point) geom.Geometry {
 	return geom.NewPointXY(ll.Lng.Degrees(), ll.Lat.Degrees()).AsGeometry()
 }
 
+func s2MultiPointToGeom(pv *s2.PointVector) geom.Geometry {
+	pts := make([]geom.Point, len(*pv))
+	for i, pt := range *pv {
+		ll := s2.LatLngFromPoint(pt)
+		pts[i] = geom.NewPointXY(ll.Lng.Degrees(), ll.Lat.Degrees())
+	}
+	return geom.NewMultiPoint(pts).AsGeometry()
+}
+
 func s2PolylineToGeom(pl *s2.Polyline) geom.Geometry {
 	coords := make([]float64, 0, len(*pl)*2)
 	for _, pt := range *pl {
@@ -196,22 +226,4 @@ func s2PolygonToGeom(poly *s2.Polygon) geom.Geometry {
 		return geom.NewPolygon(nil).AsGeometry()
 	}
 	return geom.NewPolygon(rings).AsGeometry()
-}
-
-func s2MultiPointToGeom(mp *MultiPointData) geom.Geometry {
-	pts := make([]geom.Point, len(mp.Points))
-	for i, pt := range mp.Points {
-		ll := s2.LatLngFromPoint(pt)
-		pts[i] = geom.NewPointXY(ll.Lng.Degrees(), ll.Lat.Degrees())
-	}
-	return geom.NewMultiPoint(pts).AsGeometry()
-}
-
-func s2MultiPolylineToGeom(mpl *MultiPolylineData) geom.Geometry {
-	var lines []geom.LineString
-	for _, pl := range mpl.Polylines {
-		g := s2PolylineToGeom(pl)
-		lines = append(lines, g.MustAsLineString())
-	}
-	return geom.NewMultiLineString(lines).AsGeometry()
 }

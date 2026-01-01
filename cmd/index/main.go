@@ -55,27 +55,26 @@ func main() {
 		go func() {
 			defer wg.Done()
 
-			// Reusable struct to avoid allocation in loop
-			var tempFeature geom.GeoJSONFeature
-
 			for job := range jobChan {
-				// We need to parse enough to get the ID and Props for ID generation
-				// Note: We are parsing twice (here and in PrepareIndexEntry) for simplicity,
-				// but to optimize further, you'd parse once and pass the struct.
-				// However, `PrepareIndexEntry` expects bytes.
-				if err := json.Unmarshal(job.RawFeature, &tempFeature); err != nil {
+				// We declare the struct inside the loop to avoid Properties map merging
+				// issues if we reused the variable across iterations.
+				var feature geom.GeoJSONFeature
+
+				// Parse once
+				if err := json.Unmarshal(job.RawFeature, &feature); err != nil {
 					continue
 				}
 
 				id := uuid.New().String()
-				if tempFeature.ID != nil {
-					id = fmt.Sprintf("%v", tempFeature.ID)
-				} else if n, ok := tempFeature.Properties["name"]; ok {
+				if feature.ID != nil {
+					id = fmt.Sprintf("%v", feature.ID)
+				} else if n, ok := feature.Properties["name"]; ok {
 					id = fmt.Sprintf("%v", n)
 				}
 
 				// Heavy Lifting here: S2 math, Encoding
-				entry, err := store.PrepareIndexEntry(id, job.RawFeature)
+				// We pass the already parsed feature struct.
+				entry, err := store.PrepareIndexEntry(id, feature)
 				if err == nil {
 					resultChan <- entry
 				} else {

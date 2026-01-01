@@ -42,13 +42,12 @@ func TestGeoStore(t *testing.T) {
 	if err := store.Put("montreal", ptC); err != nil {
 		t.Fatal(err)
 	}
-	// Fix: Use "downtown_box" as the ID to match the assertion below
 	if err := store.Put("downtown_box", polyD); err != nil {
 		t.Fatal(err)
 	}
 
 	// Query Proximity (Center: Toronto, 10km)
-	results, err := store.FindClosest(43.6532, -79.3832, 10000)
+	results, err := store.FindClosest(43.6532, -79.3832, 10000, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +64,18 @@ func TestGeoStore(t *testing.T) {
 	// Check Distance order
 	if len(results) > 0 && results[0].ID != "downtown_box" {
 		t.Errorf("Expected downtown_box to be first (dist ~0), got %s", results[0].ID)
+	}
+
+	// Test without geometry
+	resultsNoGeom, err := store.FindClosest(43.6532, -79.3832, 10000, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resultsNoGeom) != 3 {
+		t.Errorf("Expected 3 results, got %d", len(resultsNoGeom))
+	}
+	if !resultsNoGeom[0].Geometry.IsEmpty() {
+		t.Errorf("Expected empty geometry when withGeometry=false")
 	}
 }
 

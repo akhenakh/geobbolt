@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	bucketObjects = "objects" // Value: [Type][S2Len][S2Bytes][Props]
+	bucketObjects = "objects" // Value: [PropsLen][Props][ShapeCount][Shapes...][Index]
 	bucketIndex   = "index"   // Key: Term\x00ID
 )
 
@@ -30,16 +30,13 @@ type StoredItem struct {
 	Distance   float64
 }
 
-// IndexEntry holds pre-calculated data ready to be written to disk
 type IndexEntry struct {
 	ID    string
-	Blob  []byte   // The binary encoding (Geo + Props)
-	Terms []string // The S2 index terms
+	Blob  []byte
+	Terms []string
 }
 
 func NewGeoStore(dbPath string) (*GeoStore, error) {
-	// Open with options to allow better fill percentage on bulk imports
-	// strict mode off can be faster, but default is safer.
 	db, err := bolt.Open(dbPath, 0600, nil)
 	if err != nil {
 		return nil, err
@@ -69,46 +66,39 @@ func (gs *GeoStore) Close() error {
 	return gs.db.Close()
 }
 
-// PrepareIndexEntry performs all CPU heavy work (Parsing, Math, Encoding).
-func (gs *GeoStore) PrepareIndexEntry(id string, geoJSON []byte) (IndexEntry, error) {
-	var feature geom.GeoJSONFeature
-	if err := json.Unmarshal(geoJSON, &feature); err != nil {
-		return IndexEntry{}, fmt.Errorf("invalid geojson: %w", err)
-	}
+// PrepareIndexEntry performs all CPU heavy work (S2 Math, Encoding).
+// It accepts a parsed geom.GeoJSONFeature to avoid double unmarshalling.
+func (gs *GeoStore) PrepareIndexEntry(id string, feature geom.GeoJSONFeature) (IndexEntry, error) {
 	if feature.Geometry.IsEmpty() {
 		return IndexEntry{}, errors.New("geometry is empty")
 	}
 
-	//  Convert to S2 Storage Data AND Index Regions
-	// storageData is the object (like *MultiPointData)
-	// indexRegions is a list of atoms (like []PointRegion)
-	storageData, indexRegions, err := geomToS2(feature.Geometry)
+	// 1. Convert to S2 Shapes
+	shapes, regions, err := geomToS2(feature.Geometry)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// Props
+	// 2. Encode Props
 	propsJSON, err := json.Marshal(feature.Properties)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// Encode Storage Binary
-	storageBytes, err := encodeEntry(storageData, propsJSON)
+	// 3. Encode Full Binary Blob (Props + Shapes + Index)
+	blob, err := encodeFullEntry(shapes, propsJSON)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// Calculate Index Terms (Union of terms from all sub-regions)
-	// Using a map to deduplicate terms if sub-regions overlap
+	// 4. Generate Terms
 	termSet := make(map[string]struct{})
-	for _, reg := range indexRegions {
+	for _, reg := range regions {
 		terms := gs.indexer.GetIndexTerms(reg, "")
 		for _, t := range terms {
 			termSet[t] = struct{}{}
 		}
 	}
-
 	uniqueTerms := make([]string, 0, len(termSet))
 	for t := range termSet {
 		uniqueTerms = append(uniqueTerms, t)
@@ -116,12 +106,11 @@ func (gs *GeoStore) PrepareIndexEntry(id string, geoJSON []byte) (IndexEntry, er
 
 	return IndexEntry{
 		ID:    id,
-		Blob:  storageBytes,
+		Blob:  blob,
 		Terms: uniqueTerms,
 	}, nil
 }
 
-// WriteBatch writes a slice of pre-calculated entries in a single transaction.
 func (gs *GeoStore) WriteBatch(entries []IndexEntry) error {
 	return gs.db.Update(func(tx *bolt.Tx) error {
 		bObj := tx.Bucket([]byte(bucketObjects))
@@ -147,16 +136,19 @@ func (gs *GeoStore) WriteBatch(entries []IndexEntry) error {
 	})
 }
 
-// Put Legacy helper wrapper
 func (gs *GeoStore) Put(id string, geoJSON []byte) error {
-	entry, err := gs.PrepareIndexEntry(id, geoJSON)
+	var feature geom.GeoJSONFeature
+	if err := json.Unmarshal(geoJSON, &feature); err != nil {
+		return fmt.Errorf("invalid geojson: %w", err)
+	}
+	entry, err := gs.PrepareIndexEntry(id, feature)
 	if err != nil {
 		return err
 	}
 	return gs.WriteBatch([]IndexEntry{entry})
 }
 
-func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64) ([]StoredItem, error) {
+func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64, withGeometry bool) ([]StoredItem, error) {
 	center := s2.PointFromLatLng(s2.LatLngFromDegrees(lat, lng))
 	earthRadiusMeters := 6371000.0
 	angleRadius := s1.Angle(radiusMeters / earthRadiusMeters)
@@ -196,60 +188,70 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64) ([]Store
 				continue
 			}
 
-			geomData, propsJSON, err := decodeEntry(data)
+			propsJSON, lazyIndex, factory, err := decodeFullEntry(data)
 			if err != nil {
 				continue
 			}
 
-			distAngle := s1.InfAngle()
+			limit := s1.ChordAngleFromAngle(angleRadius)
 
-			// Calculate distance based on type
-			switch v := geomData.(type) {
-			case s2.Point:
-				distAngle = v.Distance(center)
-			case *s2.Polyline:
-				p, _ := v.Project(center)
-				distAngle = p.Distance(center)
-			case *s2.Polygon:
-				if v.ContainsPoint(center) {
-					distAngle = 0
-				} else {
-					index := s2.NewShapeIndex()
-					index.Add(v)
-					query := s2.NewClosestEdgeQuery(index, s2.NewClosestEdgeQueryOptions().MaxResults(1))
-					target := s2.NewMinDistanceToPointTarget(center)
-					res := query.FindEdges(target)
-					if len(res) > 0 {
-						distAngle = res[0].Distance().Angle()
-					}
+			// Fast cull using index iterator
+			iter := lazyIndex.Iterator()
+			match := false
+
+			// Scan index cells
+			for iter.Begin(); !iter.Done(); iter.Next() {
+				cellID := iter.CellID()
+				cell := s2.CellFromCellID(cellID)
+
+				// Conservative distance to cell
+				if cell.Distance(center) > limit {
+					continue
 				}
-			case *MultiPointData:
-				for _, p := range v.Points {
-					d := p.Distance(center)
-					if d < distAngle {
-						distAngle = d
-					}
+
+				// Check for shapes in this cell (if any)
+				idxCell := iter.IndexCell()
+				if idxCell.NumClipped() > 0 {
+					match = true
 				}
-			case *MultiPolylineData:
-				for _, poly := range v.Polylines {
-					p, _ := poly.Project(center)
-					d := p.Distance(center)
-					if d < distAngle {
-						distAngle = d
+			}
+
+			if !match {
+				continue
+			}
+
+			// Load shapes from factory for precise check
+			shapes := make([]s2.Shape, factory.Len())
+			for i := 0; i < factory.Len(); i++ {
+				shapes[i] = factory.GetShape(i)
+			}
+
+			// Brute force distance check on full geometry
+			minDistAngle := s1.InfAngle()
+			for _, s := range shapes {
+				for i := 0; i < s.NumEdges(); i++ {
+					e := s.Edge(i)
+					d := s2.DistanceFromSegment(center, e.V0, e.V1)
+					if d < minDistAngle {
+						minDistAngle = d
 					}
 				}
 			}
 
-			if distAngle <= angleRadius {
-				geo, _ := s2ToGeom(geomData)
+			if minDistAngle <= angleRadius {
 				var props map[string]interface{}
 				_ = json.Unmarshal(propsJSON, &props)
+
+				var geo geom.Geometry
+				if withGeometry {
+					geo = shapesToGeom(shapes)
+				}
 
 				results = append(results, StoredItem{
 					ID:         id,
 					Geometry:   geo,
 					Properties: props,
-					Distance:   float64(distAngle) * earthRadiusMeters,
+					Distance:   float64(minDistAngle) * earthRadiusMeters,
 				})
 			}
 		}

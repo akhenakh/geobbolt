@@ -4,153 +4,208 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 
 	"github.com/golang/geo/s2"
 )
 
 const (
-	typePoint         byte = 1
-	typePolyline      byte = 2
-	typePolygon       byte = 3
-	typeMultiPoint    byte = 4
-	typeMultiPolyline byte = 5
+	typePointVector byte = 1
+	typePolyline    byte = 2
+	typePolygon     byte = 3
 )
 
-// encodeEntry accepts s2 objects or *Multi...Data structs
-func encodeEntry(data interface{}, props []byte) ([]byte, error) {
-	var typeByte byte
+// encodeFullEntry encodes properties and the spatial index (including shapes) into a blob.
+func encodeFullEntry(shapes []s2.Shape, props []byte) ([]byte, error) {
 	var buf bytes.Buffer
 
-	switch r := data.(type) {
-	case s2.Point:
-		typeByte = typePoint
-		if err := r.Encode(&buf); err != nil {
-			return nil, err
-		}
-	case *s2.Polyline:
-		typeByte = typePolyline
-		if err := r.Encode(&buf); err != nil {
-			return nil, err
-		}
-	case *s2.Polygon:
-		typeByte = typePolygon
-		if err := r.Encode(&buf); err != nil {
-			return nil, err
-		}
-	case *MultiPointData:
-		typeByte = typeMultiPoint
-		nm := uint64(len(r.Points))
-		var b [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(b[:], nm)
-		buf.Write(b[:n])
-		for _, p := range r.Points {
-			if err := p.Encode(&buf); err != nil {
+	// 1. Properties
+	// [LenUvarint][Bytes]
+	var b [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(b[:], uint64(len(props)))
+	buf.Write(b[:n])
+	buf.Write(props)
+
+	// 2. Shapes
+	// [CountUvarint]
+	n = binary.PutUvarint(b[:], uint64(len(shapes)))
+	buf.Write(b[:n])
+
+	index := s2.NewShapeIndex()
+
+	for _, shape := range shapes {
+		// Add to index
+		index.Add(shape)
+
+		// Encode shape individually
+		// [TypeByte][LenUvarint][Bytes]
+		var shapeBuf bytes.Buffer
+		var typeByte byte
+
+		switch s := shape.(type) {
+		case *s2.PointVector:
+			typeByte = typePointVector
+			// PointVector doesn't have built-in Encode, manual encoding:
+			// [NumPoints][P1][P2]...
+			np := uint64(len(*s))
+			n := binary.PutUvarint(b[:], np)
+			shapeBuf.Write(b[:n])
+			for _, pt := range *s {
+				if err := pt.Encode(&shapeBuf); err != nil {
+					return nil, err
+				}
+			}
+		case *s2.Polyline:
+			typeByte = typePolyline
+			if err := s.Encode(&shapeBuf); err != nil {
 				return nil, err
 			}
-		}
-	case *MultiPolylineData:
-		typeByte = typeMultiPolyline
-		nm := uint64(len(r.Polylines))
-		var b [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(b[:], nm)
-		buf.Write(b[:n])
-		for _, pl := range r.Polylines {
-			if err := pl.Encode(&buf); err != nil {
+		case *s2.Polygon:
+			typeByte = typePolygon
+			if err := s.Encode(&shapeBuf); err != nil {
 				return nil, err
 			}
+		default:
+			return nil, fmt.Errorf("unsupported shape type for encoding: %T", shape)
 		}
-	default:
-		return nil, fmt.Errorf("unsupported type for encoding: %T", data)
+
+		buf.WriteByte(typeByte)
+		n := binary.PutUvarint(b[:], uint64(shapeBuf.Len()))
+		buf.Write(b[:n])
+		buf.Write(shapeBuf.Bytes())
 	}
 
-	s2Bytes := buf.Bytes()
-	s2Len := len(s2Bytes)
+	// 3. Index
+	// Index must be built before encoding
+	index.Build()
+	if err := index.Encode(&buf); err != nil {
+		return nil, err
+	}
 
-	out := bytes.NewBuffer(make([]byte, 0, 1+5+s2Len+len(props)))
-
-	out.WriteByte(typeByte)
-	lenBuf := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutUvarint(lenBuf, uint64(s2Len))
-	out.Write(lenBuf[:n])
-
-	out.Write(s2Bytes)
-	out.Write(props)
-
-	return out.Bytes(), nil
+	return buf.Bytes(), nil
 }
 
-func decodeEntry(data []byte) (interface{}, []byte, error) {
-	if len(data) < 2 {
-		return nil, nil, fmt.Errorf("invalid data length")
+// LazyShapeFactory implements s2.ShapeFactory to lazy load shapes from the buffer.
+type LazyShapeFactory struct {
+	r      *bytes.Reader
+	shapes []shapeInfo // offsets and types
+}
+
+type shapeInfo struct {
+	offset int64
+	length int64
+	typ    byte
+}
+
+func (f *LazyShapeFactory) GetShape(id int) s2.Shape {
+	if id < 0 || id >= len(f.shapes) {
+		return nil
 	}
+	info := f.shapes[id]
 
-	typeByte := data[0]
-
-	s2Len, n := binary.Uvarint(data[1:])
-	if n <= 0 {
-		return nil, nil, fmt.Errorf("invalid s2 length varint")
+	// Seek and read
+	if _, err := f.r.Seek(info.offset, io.SeekStart); err != nil {
+		return nil
 	}
+	// Limit reader
+	lr := io.LimitReader(f.r, info.length)
 
-	s2Start := 1 + n
-	s2End := s2Start + int(s2Len)
-
-	if s2End > len(data) {
-		return nil, nil, fmt.Errorf("data corrupted: s2 length exceeds buffer")
-	}
-
-	s2Data := data[s2Start:s2End]
-	propsData := data[s2End:]
-
-	r := bytes.NewReader(s2Data)
-	var geometryData interface{}
-	var err error
-
-	switch typeByte {
-	case typePoint:
-		var p s2.Point
-		err = p.Decode(r)
-		geometryData = p
-	case typePolyline:
-		var p s2.Polyline
-		err = p.Decode(r)
-		geometryData = &p
-	case typePolygon:
-		var p s2.Polygon
-		err = p.Decode(r)
-		geometryData = &p
-	case typeMultiPoint:
-		count, errV := binary.ReadUvarint(r)
-		if errV != nil {
-			return nil, nil, errV
+	switch info.typ {
+	case typePointVector:
+		// Manual decode
+		count, err := binary.ReadUvarint(f.r) // consumes from reader, updates offset
+		if err != nil {
+			return nil
 		}
+		// binary.ReadUvarint is a byte reader, using f.r directly is risky if we wrap it.
+		// Re-make byte reader approach or just read carefully.
+		// Actually f.r is *bytes.Reader, which implements ByteReader.
+
 		pts := make([]s2.Point, count)
 		for i := 0; i < int(count); i++ {
-			if err := pts[i].Decode(r); err != nil {
-				return nil, nil, err
+			if err := pts[i].Decode(f.r); err != nil {
+				return nil
 			}
 		}
-		geometryData = &MultiPointData{Points: pts}
-	case typeMultiPolyline:
-		count, errV := binary.ReadUvarint(r)
-		if errV != nil {
-			return nil, nil, errV
+		pv := s2.PointVector(pts)
+		return &pv
+	case typePolyline:
+		var p s2.Polyline
+		if err := p.Decode(lr); err != nil {
+			return nil
 		}
-		polys := make([]*s2.Polyline, count)
-		for i := 0; i < int(count); i++ {
-			var p s2.Polyline
-			if err := p.Decode(r); err != nil {
-				return nil, nil, err
-			}
-			polys[i] = &p
+		return &p
+	case typePolygon:
+		var p s2.Polygon
+		if err := p.Decode(lr); err != nil {
+			return nil
 		}
-		geometryData = &MultiPolylineData{Polylines: polys}
-	default:
-		return nil, nil, fmt.Errorf("unknown geometry type byte: %d", typeByte)
+		return &p
 	}
+	return nil
+}
 
+func (f *LazyShapeFactory) Len() int {
+	return len(f.shapes)
+}
+
+// decodeFullEntry parses headers and returns properties, the lazy index, and the factory.
+func decodeFullEntry(data []byte) ([]byte, *s2.EncodedS2ShapeIndex, *LazyShapeFactory, error) {
+	r := bytes.NewReader(data)
+
+	// 1. Properties
+	propLen, err := binary.ReadUvarint(r)
 	if err != nil {
-		return nil, nil, fmt.Errorf("s2 decode error: %w", err)
+		return nil, nil, nil, err
+	}
+	props := make([]byte, propLen)
+	if _, err := io.ReadFull(r, props); err != nil {
+		return nil, nil, nil, err
 	}
 
-	return geometryData, propsData, nil
+	// 2. Shapes Table Scan
+	shapeCount, err := binary.ReadUvarint(r)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	infos := make([]shapeInfo, shapeCount)
+	for i := 0; i < int(shapeCount); i++ {
+		typ, err := r.ReadByte()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		length, err := binary.ReadUvarint(r)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		offset, _ := r.Seek(0, io.SeekCurrent)
+
+		infos[i] = shapeInfo{
+			offset: offset,
+			length: int64(length),
+			typ:    typ,
+		}
+
+		// Skip body
+		if _, err := r.Seek(int64(length), io.SeekCurrent); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	// 3. Index
+	// Reader is now at start of Index
+	factory := &LazyShapeFactory{r: bytes.NewReader(data), shapes: infos}
+
+	// Create a new reader from current position for the index init
+	// (EncodedS2ShapeIndex.Init wraps in bufio if not ByteReader, bytes.Reader is fine)
+	// We need to pass the *remaining* part of stream or just the reader current pos?
+	// bytes.Reader tracks position.
+
+	index := s2.NewEncodedS2ShapeIndex()
+	if err := index.Init(r, factory); err != nil {
+		return nil, nil, nil, fmt.Errorf("index init failed: %w", err)
+	}
+
+	return props, index, factory, nil
 }
