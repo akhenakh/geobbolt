@@ -70,7 +70,6 @@ func (gs *GeoStore) Close() error {
 }
 
 // PrepareIndexEntry performs all CPU heavy work (Parsing, Math, Encoding).
-// This is safe to run in parallel workers.
 func (gs *GeoStore) PrepareIndexEntry(id string, geoJSON []byte) (IndexEntry, error) {
 	var feature geom.GeoJSONFeature
 	if err := json.Unmarshal(geoJSON, &feature); err != nil {
@@ -80,31 +79,45 @@ func (gs *GeoStore) PrepareIndexEntry(id string, geoJSON []byte) (IndexEntry, er
 		return IndexEntry{}, errors.New("geometry is empty")
 	}
 
-	// 1. Convert to S2
-	region, err := geomToS2(feature.Geometry)
+	//  Convert to S2 Storage Data AND Index Regions
+	// storageData is the object (like *MultiPointData)
+	// indexRegions is a list of atoms (like []PointRegion)
+	storageData, indexRegions, err := geomToS2(feature.Geometry)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// 2. Props
+	// Props
 	propsJSON, err := json.Marshal(feature.Properties)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// 3. Encode S2 Binary
-	storageBytes, err := encodeEntry(region, propsJSON)
+	// Encode Storage Binary
+	storageBytes, err := encodeEntry(storageData, propsJSON)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// 4. Calculate Index Terms (Math heavy)
-	terms := gs.indexer.GetIndexTerms(region, "")
+	// Calculate Index Terms (Union of terms from all sub-regions)
+	// Using a map to deduplicate terms if sub-regions overlap
+	termSet := make(map[string]struct{})
+	for _, reg := range indexRegions {
+		terms := gs.indexer.GetIndexTerms(reg, "")
+		for _, t := range terms {
+			termSet[t] = struct{}{}
+		}
+	}
+
+	uniqueTerms := make([]string, 0, len(termSet))
+	for t := range termSet {
+		uniqueTerms = append(uniqueTerms, t)
+	}
 
 	return IndexEntry{
 		ID:    id,
 		Blob:  storageBytes,
-		Terms: terms,
+		Terms: uniqueTerms,
 	}, nil
 }
 
@@ -113,17 +126,13 @@ func (gs *GeoStore) WriteBatch(entries []IndexEntry) error {
 	return gs.db.Update(func(tx *bolt.Tx) error {
 		bObj := tx.Bucket([]byte(bucketObjects))
 		bIdx := tx.Bucket([]byte(bucketIndex))
-		// Optional: bIdx.FillPercent = 0.9 for bulk loading
 
 		for _, entry := range entries {
-			// Save S2 Binary blob
 			if err := bObj.Put([]byte(entry.ID), entry.Blob); err != nil {
 				return err
 			}
 
-			// Save Index Terms
 			for _, term := range entry.Terms {
-				// Allocation optimization: pre-calculate size
 				key := make([]byte, len(term)+1+len(entry.ID))
 				copy(key, term)
 				key[len(term)] = 0
@@ -187,15 +196,15 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64) ([]Store
 				continue
 			}
 
-			// Fast Decode (No Trig)
-			s2Reg, propsJSON, err := decodeEntry(data)
+			geomData, propsJSON, err := decodeEntry(data)
 			if err != nil {
 				continue
 			}
 
 			distAngle := s1.InfAngle()
 
-			switch v := s2Reg.(type) {
+			// Calculate distance based on type
+			switch v := geomData.(type) {
 			case s2.Point:
 				distAngle = v.Distance(center)
 			case *s2.Polyline:
@@ -214,11 +223,25 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64) ([]Store
 						distAngle = res[0].Distance().Angle()
 					}
 				}
+			case *MultiPointData:
+				for _, p := range v.Points {
+					d := p.Distance(center)
+					if d < distAngle {
+						distAngle = d
+					}
+				}
+			case *MultiPolylineData:
+				for _, poly := range v.Polylines {
+					p, _ := poly.Project(center)
+					d := p.Distance(center)
+					if d < distAngle {
+						distAngle = d
+					}
+				}
 			}
 
 			if distAngle <= angleRadius {
-				// Only reconstruct geometry here for output
-				geo, _ := s2ToGeom(s2Reg)
+				geo, _ := s2ToGeom(geomData)
 				var props map[string]interface{}
 				_ = json.Unmarshal(propsJSON, &props)
 
@@ -241,30 +264,4 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64) ([]Store
 	})
 
 	return results, nil
-}
-
-func CompactDB(srcPath, dstPath string) error {
-	// Open Source DB
-	src, err := bolt.Open(srcPath, 0600, nil)
-	if err != nil {
-		return fmt.Errorf("failed to open src db: %w", err)
-	}
-	defer src.Close()
-
-	// Open Destination DB
-	dst, err := bolt.Open(dstPath, 0600, nil)
-	if err != nil {
-		return fmt.Errorf("failed to open dst db: %w", err)
-	}
-	defer dst.Close()
-
-	// Compact
-	// txMaxSize is the transaction size limit (0 = default 64k).
-	// It creates a transaction, copies data until size limit, then commits and starts new tx.
-	err = bolt.Compact(dst, src, 0)
-	if err != nil {
-		return fmt.Errorf("compaction failed: %w", err)
-	}
-
-	return nil
 }
