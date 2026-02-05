@@ -26,14 +26,15 @@ type GeoStore struct {
 type StoredItem struct {
 	ID         string
 	Geometry   geom.Geometry
-	Properties map[string]interface{}
+	Properties map[string]any
 	Distance   float64
 }
 
 type IndexEntry struct {
-	ID    string
-	Blob  []byte
-	Terms []string
+	ID            string
+	Blob          []byte
+	InteriorTerms []string // Cells completely inside the polygon (guaranteed match)
+	ExteriorTerms []string // Cells intersecting the polygon boundary (need PIP test)
 }
 
 func NewGeoStore(dbPath string) (*GeoStore, error) {
@@ -73,41 +74,69 @@ func (gs *GeoStore) PrepareIndexEntry(id string, feature geom.GeoJSONFeature) (I
 		return IndexEntry{}, errors.New("geometry is empty")
 	}
 
-	// 1. Convert to S2 Shapes
+	// Convert to S2 Shapes
 	shapes, regions, err := geomToS2(feature.Geometry)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// 2. Encode Props
+	// Encode Props
 	propsJSON, err := json.Marshal(feature.Properties)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// 3. Encode Full Binary Blob (Props + Shapes + Index)
+	// Encode Full Binary Blob (Props + Shapes + Index)
 	blob, err := encodeFullEntry(shapes, propsJSON)
 	if err != nil {
 		return IndexEntry{}, err
 	}
 
-	// 4. Generate Terms
-	termSet := make(map[string]struct{})
+	// Generate Interior and Exterior Covers
+	// Interior cover: cells completely inside the polygon (if interior cell matches, polygon is definitely inside)
+	// Exterior cover: cells intersecting the polygon (if only exterior matches, need point-in-polygon test)
+	interiorTermSet := make(map[string]struct{})
+	exteriorTermSet := make(map[string]struct{})
+
+	// Create a RegionCoverer with same options as the indexer
+	rc := &s2.RegionCoverer{
+		MinLevel: gs.indexer.Options.MinLevel,
+		MaxLevel: gs.indexer.Options.MaxLevel,
+		MaxCells: gs.indexer.Options.MaxCells,
+	}
+
 	for _, reg := range regions {
-		terms := gs.indexer.GetIndexTerms(reg, "")
+		// Exterior cover: cells that intersect the region
+		exteriorCells := rc.Covering(reg)
+		terms := gs.indexer.GetIndexTermsForCanonicalCovering(exteriorCells, "")
 		for _, t := range terms {
-			termSet[t] = struct{}{}
+			exteriorTermSet[t] = struct{}{}
+		}
+
+		// Interior cover: cells completely inside the region (only for polygons)
+		// For non-polygon regions (points, lines), interior cover is empty
+		interiorCells := rc.InteriorCovering(reg)
+		terms = gs.indexer.GetIndexTermsForCanonicalCovering(interiorCells, "")
+		for _, t := range terms {
+			interiorTermSet[t] = struct{}{}
 		}
 	}
-	uniqueTerms := make([]string, 0, len(termSet))
-	for t := range termSet {
-		uniqueTerms = append(uniqueTerms, t)
+
+	// Convert sets to slices
+	interiorTerms := make([]string, 0, len(interiorTermSet))
+	for t := range interiorTermSet {
+		interiorTerms = append(interiorTerms, t)
+	}
+	exteriorTerms := make([]string, 0, len(exteriorTermSet))
+	for t := range exteriorTermSet {
+		exteriorTerms = append(exteriorTerms, t)
 	}
 
 	return IndexEntry{
-		ID:    id,
-		Blob:  blob,
-		Terms: uniqueTerms,
+		ID:            id,
+		Blob:          blob,
+		InteriorTerms: interiorTerms,
+		ExteriorTerms: exteriorTerms,
 	}, nil
 }
 
@@ -121,11 +150,28 @@ func (gs *GeoStore) WriteBatch(entries []IndexEntry) error {
 				return err
 			}
 
-			for _, term := range entry.Terms {
-				key := make([]byte, len(term)+1+len(entry.ID))
-				copy(key, term)
-				key[len(term)] = 0
-				copy(key[len(term)+1:], entry.ID)
+			// Store interior terms with "int:" prefix
+			// Interior terms guarantee the polygon contains the query point
+			for _, term := range entry.InteriorTerms {
+				prefixedTerm := "int:" + term
+				key := make([]byte, len(prefixedTerm)+1+len(entry.ID))
+				copy(key, prefixedTerm)
+				key[len(prefixedTerm)] = 0
+				copy(key[len(prefixedTerm)+1:], entry.ID)
+
+				if err := bIdx.Put(key, []byte("1")); err != nil {
+					return err
+				}
+			}
+
+			// Store exterior terms with "ext:" prefix
+			// Exterior terms require point-in-polygon test for confirmation
+			for _, term := range entry.ExteriorTerms {
+				prefixedTerm := "ext:" + term
+				key := make([]byte, len(prefixedTerm)+1+len(entry.ID))
+				copy(key, prefixedTerm)
+				key[len(prefixedTerm)] = 0
+				copy(key[len(prefixedTerm)+1:], entry.ID)
 
 				if err := bIdx.Put(key, []byte("1")); err != nil {
 					return err
@@ -155,20 +201,35 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64, withGeom
 	capRegion := s2.CapFromCenterAngle(center, angleRadius)
 	queryTerms := gs.indexer.GetQueryTerms(capRegion, "")
 
-	candidates := make(map[string]struct{})
+	// Two-pass approach with interior/exterior optimization:
+	// 1. Interior candidates: matched via interior cover terms (guaranteed to be inside polygon)
+	// 2. Exterior candidates: matched only via exterior cover terms (need point-in-polygon test)
+	interiorCandidates := make(map[string]struct{})
+	exteriorCandidates := make(map[string]struct{})
 
 	err := gs.db.View(func(tx *bolt.Tx) error {
 		bIdx := tx.Bucket([]byte(bucketIndex))
 		c := bIdx.Cursor()
 
+		// First pass: query interior terms (guaranteed matches for polygons)
 		for _, term := range queryTerms {
-			prefix := make([]byte, 0, len(term)+1)
-			prefix = append(prefix, term...)
-			prefix = append(prefix, 0)
+			interiorPrefix := []byte("int:" + term + "\x00")
+			for k, _ := c.Seek(interiorPrefix); k != nil && bytes.HasPrefix(k, interiorPrefix); k, _ = c.Next() {
+				idBytes := bytes.TrimPrefix(k, interiorPrefix)
+				interiorCandidates[string(idBytes)] = struct{}{}
+			}
+		}
 
-			for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-				idBytes := bytes.TrimPrefix(k, prefix)
-				candidates[string(idBytes)] = struct{}{}
+		// Second pass: query exterior terms
+		// Only add to exteriorCandidates if not already in interiorCandidates
+		for _, term := range queryTerms {
+			exteriorPrefix := []byte("ext:" + term + "\x00")
+			for k, _ := c.Seek(exteriorPrefix); k != nil && bytes.HasPrefix(k, exteriorPrefix); k, _ = c.Next() {
+				idBytes := bytes.TrimPrefix(k, exteriorPrefix)
+				id := string(idBytes)
+				if _, isInterior := interiorCandidates[id]; !isInterior {
+					exteriorCandidates[id] = struct{}{}
+				}
 			}
 		}
 		return nil
@@ -182,77 +243,25 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64, withGeom
 	err = gs.db.View(func(tx *bolt.Tx) error {
 		bObj := tx.Bucket([]byte(bucketObjects))
 
-		for id := range candidates {
-			data := bObj.Get([]byte(id))
-			if data == nil {
-				continue
-			}
-
-			propsJSON, lazyIndex, factory, err := decodeFullEntry(data)
+		// Process interior candidates first (no PIP test needed)
+		for id := range interiorCandidates {
+			item, err := gs.processCandidate(id, center, angleRadius, withGeometry, bObj, true)
 			if err != nil {
 				continue
 			}
-
-			limit := s1.ChordAngleFromAngle(angleRadius)
-
-			// Fast cull using index iterator
-			iter := lazyIndex.Iterator()
-			match := false
-
-			// Scan index cells
-			for iter.Begin(); !iter.Done(); iter.Next() {
-				cellID := iter.CellID()
-				cell := s2.CellFromCellID(cellID)
-
-				// Conservative distance to cell
-				if cell.Distance(center) > limit {
-					continue
-				}
-
-				// Check for shapes in this cell (if any)
-				idxCell := iter.IndexCell()
-				if idxCell.NumClipped() > 0 {
-					match = true
-				}
+			if item != nil {
+				results = append(results, *item)
 			}
+		}
 
-			if !match {
+		// Process exterior candidates (need full distance check)
+		for id := range exteriorCandidates {
+			item, err := gs.processCandidate(id, center, angleRadius, withGeometry, bObj, false)
+			if err != nil {
 				continue
 			}
-
-			// Load shapes from factory for precise check
-			shapes := make([]s2.Shape, factory.Len())
-			for i := 0; i < factory.Len(); i++ {
-				shapes[i] = factory.GetShape(i)
-			}
-
-			// Brute force distance check on full geometry
-			minDistAngle := s1.InfAngle()
-			for _, s := range shapes {
-				for i := 0; i < s.NumEdges(); i++ {
-					e := s.Edge(i)
-					d := s2.DistanceFromSegment(center, e.V0, e.V1)
-					if d < minDistAngle {
-						minDistAngle = d
-					}
-				}
-			}
-
-			if minDistAngle <= angleRadius {
-				var props map[string]interface{}
-				_ = json.Unmarshal(propsJSON, &props)
-
-				var geo geom.Geometry
-				if withGeometry {
-					geo = shapesToGeom(shapes)
-				}
-
-				results = append(results, StoredItem{
-					ID:         id,
-					Geometry:   geo,
-					Properties: props,
-					Distance:   float64(minDistAngle) * earthRadiusMeters,
-				})
+			if item != nil {
+				results = append(results, *item)
 			}
 		}
 		return nil
@@ -266,4 +275,110 @@ func (gs *GeoStore) FindClosest(lat, lng float64, radiusMeters float64, withGeom
 	})
 
 	return results, nil
+}
+
+// processCandidate processes a single candidate and returns a StoredItem if it matches
+// isInteriorMatch: if true, the candidate matched an interior cell (guaranteed inside for polygons)
+func (gs *GeoStore) processCandidate(id string, center s2.Point, angleRadius s1.Angle, withGeometry bool, bObj *bolt.Bucket, isInteriorMatch bool) (*StoredItem, error) {
+	data := bObj.Get([]byte(id))
+	if data == nil {
+		return nil, fmt.Errorf("data not found for id: %s", id)
+	}
+
+	propsJSON, lazyIndex, factory, err := decodeFullEntry(data)
+	if err != nil {
+		return nil, err
+	}
+
+	limit := s1.ChordAngleFromAngle(angleRadius)
+
+	// Fast cull using index iterator
+	iter := lazyIndex.Iterator()
+	match := false
+
+	// Scan index cells
+	for iter.Begin(); !iter.Done(); iter.Next() {
+		cellID := iter.CellID()
+		cell := s2.CellFromCellID(cellID)
+
+		// Conservative distance to cell
+		if cell.Distance(center) > limit {
+			continue
+		}
+
+		// Check for shapes in this cell (if any)
+		idxCell := iter.IndexCell()
+		if idxCell.NumClipped() > 0 {
+			match = true
+			break
+		}
+	}
+
+	if !match {
+		return nil, nil
+	}
+
+	// Load shapes from factory for precise check
+	shapes := make([]s2.Shape, factory.Len())
+	for i := range factory.Len() {
+		shapes[i] = factory.GetShape(i)
+	}
+
+	// For interior matches on polygons, we can optimize by checking if center is inside
+	// This avoids the expensive edge-by-edge distance calculation
+	var minDistAngle s1.Angle
+	if isInteriorMatch && len(shapes) > 0 {
+		// Check if this is a polygon shape
+		switch s := shapes[0].(type) {
+		case *s2.Polygon:
+			// For interior matches, we know the query point is in an interior cell
+			// But we still need to verify it's within the radius
+			if s.ContainsPoint(center) {
+				minDistAngle = 0 // Inside polygon, distance is 0
+			} else {
+				// Fallback to edge distance
+				minDistAngle = gs.calculateMinDistance(center, shapes)
+			}
+		default:
+			// For non-polygon shapes, calculate normal distance
+			minDistAngle = gs.calculateMinDistance(center, shapes)
+		}
+	} else {
+		// For exterior matches or non-polygons, do full distance calculation
+		minDistAngle = gs.calculateMinDistance(center, shapes)
+	}
+
+	if minDistAngle <= angleRadius {
+		var props map[string]any
+		_ = json.Unmarshal(propsJSON, &props)
+
+		var geo geom.Geometry
+		if withGeometry {
+			geo = shapesToGeom(shapes)
+		}
+
+		return &StoredItem{
+			ID:         id,
+			Geometry:   geo,
+			Properties: props,
+			Distance:   float64(minDistAngle) * 6371000.0,
+		}, nil
+	}
+
+	return nil, nil
+}
+
+// calculateMinDistance computes the minimum distance from center to any edge in shapes
+func (gs *GeoStore) calculateMinDistance(center s2.Point, shapes []s2.Shape) s1.Angle {
+	minDistAngle := s1.InfAngle()
+	for _, s := range shapes {
+		for i := range s.NumEdges() {
+			e := s.Edge(i)
+			d := s2.DistanceFromSegment(center, e.V0, e.V1)
+			if d < minDistAngle {
+				minDistAngle = d
+			}
+		}
+	}
+	return minDistAngle
 }
